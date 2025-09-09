@@ -22,11 +22,10 @@ exports.handler = async function (event, context) {
       return { statusCode: 400, body: JSON.stringify({ ok: false, error: 'invalid_json' }) };
     }
 
-    // If client already wrapped under "body" and that body looks like the inner payload, keep it as-is.
-    // Otherwise wrap once so n8n expressions like $json["body"]["type"] work.
-    const payload = (incoming && incoming.body && typeof incoming.body === 'object') ? incoming.body : incoming;
+    // Incoming payload directly (no wrapping under "body")
+    const payload = incoming;
 
-    // Basic 'type' check (lowercased) for validation only
+    // Basic 'type' check (lowercased) for validation
     const typeLower = (payload && payload.type || "").toString().toLowerCase();
 
     if (!typeLower) {
@@ -63,16 +62,8 @@ exports.handler = async function (event, context) {
       upstreamHeaders['Authorization'] = event.headers.authorization || event.headers.Authorization;
     }
 
-    // If payload is top-level (has type), wrap once for n8n. If payload already is the n8n-shaped object (i.e., has body),
-    // then send it as-is. We used `payload` earlier as the *inner* payload, so decide like this:
-    let forwardedPayload;
-    if (incoming && incoming.body && typeof incoming.body === 'object') {
-      // client already sent { body: { ... } } — forward as-is
-      forwardedPayload = incoming;
-    } else {
-      // client sent the inner object — wrap it once to become { body: { ... } }
-      forwardedPayload = { body: payload };
-    }
+    // Always forward the plain payload (no "body" wrapper)
+    const forwardedPayload = payload;
 
     const resp = await fetch(N8N_WEBHOOK_URL, {
       method: 'POST',
