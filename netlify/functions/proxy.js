@@ -55,12 +55,14 @@ exports.handler = async function (event, context) {
     }
 
     // Compose upstream URL:
-    // - If N8N_WEBHOOK_URL is a full URL and a path param is provided, append it.
-    // - If N8N_WEBHOOK_URL already contains full webhook path (no extra path param), you'll just hit it directly.
     const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
     if (!N8N_WEBHOOK_URL) {
       return { statusCode: 500, body: JSON.stringify({ ok: false, error: 'missing_n8n_webhook_env' }) };
     }
+
+    // Optional explicit per-endpoint overrides (full URLs)
+    const N8N_TRACKER_URL = process.env.N8N_TRACKER_URL || '';
+    const N8N_TRACKER_SUGGESTIONS_URL = process.env.N8N_TRACKER_SUGGESTIONS_URL || '';
 
     // Accept optional override path via query param or header:
     const queryPath = (event.queryStringParameters && event.queryStringParameters.path) || '';
@@ -69,7 +71,16 @@ exports.handler = async function (event, context) {
 
     // Normalize base url (remove trailing slash)
     const base = N8N_WEBHOOK_URL.replace(/\/+$/, '');
-    const upstreamUrl = extraPath ? `${base.replace(/\/+$/, '')}/${extraPath.replace(/^\/+/, '')}` : base;
+
+    // build upstreamUrl (let because we may reassign)
+    let upstreamUrl = extraPath ? `${base}/${extraPath.replace(/^\/+/, '')}` : base;
+
+    // If caller specifically asked for tracker endpoints and we have explicit env overrides, use them
+    if (extraPath === 'tracker' && N8N_TRACKER_URL) {
+      upstreamUrl = N8N_TRACKER_URL;
+    } else if (extraPath === 'tracker/suggestions' && N8N_TRACKER_SUGGESTIONS_URL) {
+      upstreamUrl = N8N_TRACKER_SUGGESTIONS_URL;
+    }
 
     // Prepare headers to forward upstream
     const upstreamHeaders = {};
@@ -100,6 +111,17 @@ exports.handler = async function (event, context) {
       }
     }
 
+    // For GET, optionally forward original querystring parameters (except 'path')
+    let upstreamFetchUrl = upstreamUrl;
+    if (method === 'GET') {
+      const incomingQs = event.rawQuery || event.queryStringParameters || {};
+      const qsEntries = Object.entries(incomingQs).filter(([k]) => k !== 'path');
+      if (qsEntries.length) {
+        const qs = qsEntries.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+        upstreamFetchUrl = upstreamUrl + (upstreamUrl.includes('?') ? '&' : '?') + qs;
+      }
+    }
+
     // Do the upstream fetch - forward method as-is
     const fetchOptions = {
       method,
@@ -108,21 +130,10 @@ exports.handler = async function (event, context) {
 
     if (method !== 'GET' && payload !== null) {
       fetchOptions.body = JSON.stringify(payload);
-    } else {
-      // For GET, include query params in the upstream URL if you want them
-      // (we already created upstreamUrl from base+path, but you might want to forward the original querystring)
-      // To forward the original querystring, you can append it:
-      const incomingQs = event.rawQuery || event.queryStringParameters || {};
-      const qsEntries = Object.entries(incomingQs).filter(([k]) => k !== 'path'); // drop path
-      if (qsEntries.length) {
-        const qs = qsEntries.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
-        // append with proper separator
-        upstreamUrl = upstreamUrl + (upstreamUrl.includes('?') ? '&' : '?') + qs;
-      }
     }
 
-    // perform fetch (note: upstreamUrl might have been modified above)
-    const resp = await fetch(upstreamUrl, fetchOptions);
+    // perform fetch
+    const resp = await fetch(upstreamFetchUrl, fetchOptions);
 
     // try to return upstream body as text (limit response size)
     const text = await resp.text().catch(() => '');
