@@ -1,5 +1,4 @@
 // netlify/functions/proxy.js
-// Updated proxy for Netlify functions — adds CORS handling and more robust header handling.
 const fetch = require("node-fetch");
 
 const corsHeaders = {
@@ -18,8 +17,36 @@ function getHeaderCaseInsensitive(headers, key) {
   return lower[key.toLowerCase()];
 }
 
+function parseRawQueryToObj(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "string") return out;
+  const qs = raw.replace(/^\?/, "");
+  if (!qs) return out;
+  const pairs = qs.split("&");
+  for (const p of pairs) {
+    if (!p) continue;
+    const idx = p.indexOf("=");
+    if (idx === -1) {
+      // key without value
+      const key = decodeURIComponent(p);
+      out[key] = "";
+    } else {
+      const key = decodeURIComponent(p.slice(0, idx));
+      const val = decodeURIComponent(p.slice(idx + 1));
+      // handle repeated keys -> array
+      if (Object.prototype.hasOwnProperty.call(out, key)) {
+        if (Array.isArray(out[key])) out[key].push(val);
+        else out[key] = [out[key], val];
+      } else {
+        out[key] = val;
+      }
+    }
+  }
+  return out;
+}
+
 exports.handler = async function (event, context) {
-  // Respond to preflight quickly
+  // Handle preflight
   if ((event.httpMethod || event.method || "").toUpperCase() === "OPTIONS") {
     return {
       statusCode: 200,
@@ -42,12 +69,12 @@ exports.handler = async function (event, context) {
       }
     }
 
-    // Determine incoming HTTP method
     const method = (event.httpMethod || event.method || "POST").toUpperCase();
 
     // Build payload:
     let payload = null;
     if (method === "GET") {
+      // For GET, use parsed queryStringParameters (preferred)
       payload = event.queryStringParameters || {};
     } else {
       if (!event.body) {
@@ -122,32 +149,25 @@ exports.handler = async function (event, context) {
       };
     }
 
-    // Optional explicit per-endpoint overrides (full URLs)
     const N8N_TRACKER_URL = process.env.N8N_TRACKER_URL || "";
     const N8N_TRACKER_SUGGESTIONS_URL =
       process.env.N8N_TRACKER_SUGGESTIONS_URL || "";
 
-    // Accept optional override path via query param or header:
     const queryPath =
       (event.queryStringParameters && event.queryStringParameters.path) || "";
     const headerPath =
       getHeaderCaseInsensitive(event.headers, "x-forward-path") || "";
     const extraPath = (queryPath || headerPath || "").toString();
 
-    // Normalize base url (remove trailing slash)
     const base = N8N_WEBHOOK_URL.replace(/\/+$/, "");
-
-    // build upstreamUrl (let because we may reassign)
     let upstreamUrl = extraPath
       ? `${base}/${extraPath.replace(/^\/+/, "")}`
       : base;
 
-    // fallback: if extraPath looks like a full URL, use it directly
     if (/^https?:\/\//i.test(extraPath)) {
       upstreamUrl = extraPath;
     }
 
-    // If caller specifically asked for tracker endpoints and we have explicit env overrides, use them
     if (
       (extraPath === "tracker" || extraPath === "/tracker") &&
       N8N_TRACKER_URL
@@ -163,13 +183,10 @@ exports.handler = async function (event, context) {
 
     // Prepare headers to forward upstream
     const upstreamHeaders = {};
-
-    // Forward Content-Type for POST where appropriate
     if (method !== "GET") {
       upstreamHeaders["Content-Type"] = "application/json";
     }
 
-    // Basic auth precedence: env creds > incoming Authorization header
     const N8N_USER = process.env.N8N_USER || "";
     const N8N_PASS = process.env.N8N_PASS || "";
     if (N8N_USER && N8N_PASS) {
@@ -181,7 +198,6 @@ exports.handler = async function (event, context) {
       if (incomingAuth) upstreamHeaders["Authorization"] = incomingAuth;
     }
 
-    // Forward certain incoming headers if useful (but avoid host-related headers)
     const forwardHeaderNames = [
       "x-api-key",
       "x-custom",
@@ -196,23 +212,41 @@ exports.handler = async function (event, context) {
       if (val) upstreamHeaders[hn] = val;
     }
 
-    // For GET, optionally forward original querystring parameters (except 'path')
+    // Build upstream fetch URL (robust handling of rawQuery vs parsed params)
     let upstreamFetchUrl = upstreamUrl;
     if (method === "GET") {
-      const incomingQs = event.rawQuery || event.queryStringParameters || {};
-      const qsEntries = Object.entries(incomingQs).filter(
-        ([k]) => k !== "path"
-      );
+      // Prefer parsed object from queryStringParameters (Netlify provides it)
+      let incomingQs = {};
+      if (
+        event.queryStringParameters &&
+        typeof event.queryStringParameters === "object" &&
+        Object.keys(event.queryStringParameters).length > 0
+      ) {
+        incomingQs = event.queryStringParameters;
+      } else if (event.rawQuery && typeof event.rawQuery === "string") {
+        // rawQuery is a string, parse it into an object
+        incomingQs = parseRawQueryToObj(event.rawQuery);
+      }
+
+      const qsEntries = Object.entries(incomingQs).filter(([k]) => k !== "path");
       if (qsEntries.length) {
-        const qs = qsEntries
-          .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-          .join("&");
+        // build querystring and support array values
+        const qsParts = [];
+        for (const [k, v] of qsEntries) {
+          if (Array.isArray(v)) {
+            for (const vv of v) {
+              qsParts.push(`${encodeURIComponent(k)}=${encodeURIComponent(vv)}`);
+            }
+          } else {
+            qsParts.push(`${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
+          }
+        }
+        const qs = qsParts.join("&");
         upstreamFetchUrl =
           upstreamUrl + (upstreamUrl.includes("?") ? "&" : "?") + qs;
       }
     }
 
-    // Do the upstream fetch - forward method as-is
     const fetchOptions = {
       method,
       headers: upstreamHeaders,
@@ -222,10 +256,8 @@ exports.handler = async function (event, context) {
       fetchOptions.body = JSON.stringify(payload);
     }
 
-    // perform fetch
     const resp = await fetch(upstreamFetchUrl, fetchOptions);
 
-    // try to return upstream body as text (limit response size)
     const text = await resp.text().catch(() => "");
 
     return {
