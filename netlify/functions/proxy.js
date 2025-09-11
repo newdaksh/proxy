@@ -1,10 +1,16 @@
 // netlify/functions/proxy.js
+// Updated proxy with debug logging + tracker date normalization (startDate/endDate).
+// WARNING: This version includes verbose logging and upstream body echo for staging/debug.
+// Remove or reduce logging and the echoed upstreamBody/forwardedPayload before production.
+
 const fetch = require("node-fetch");
+
+const DEV_MODE = true; // set to false before production to reduce verbose output
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
-    "Content-Type, Authorization, X-API-Key, X-Forward-Path, x-forward-path",
+    "Content-Type, Authorization, X-API-Key, X-Forward-Path, x-forward-path, X-Normalize-Date",
   "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS",
 };
 
@@ -17,257 +23,205 @@ function getHeaderCaseInsensitive(headers, key) {
   return lower[key.toLowerCase()];
 }
 
-function parseRawQueryToObj(raw) {
-  const out = {};
-  if (!raw || typeof raw !== "string") return out;
-  const qs = raw.replace(/^\?/, "");
-  if (!qs) return out;
-  const pairs = qs.split("&");
-  for (const p of pairs) {
-    if (!p) continue;
-    const idx = p.indexOf("=");
-    if (idx === -1) {
-      // key without value
-      const key = decodeURIComponent(p);
-      out[key] = "";
-    } else {
-      const key = decodeURIComponent(p.slice(0, idx));
-      const val = decodeURIComponent(p.slice(idx + 1));
-      // handle repeated keys -> array
-      if (Object.prototype.hasOwnProperty.call(out, key)) {
-        if (Array.isArray(out[key])) out[key].push(val);
-        else out[key] = [out[key], val];
-      } else {
-        out[key] = val;
-      }
-    }
+function parseJSONSafe(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
   }
-  return out;
 }
 
-exports.handler = async function (event, context) {
-  // Handle preflight
-  if ((event.httpMethod || event.method || "").toUpperCase() === "OPTIONS") {
-    return {
-      statusCode: 200,
-      headers: corsHeaders,
-      body: "",
-    };
-  }
+// Convert a local Date object (constructed using local year/month/day) to an ISO UTC string
+function toISOStringUTC(d) {
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds(), d.getMilliseconds())).toISOString();
+}
 
+// Given either "YYYY-MM-DD" or an ISO string, compute local start/end of that calendar date
+function computeStartEndFromDateString(input) {
+  if (!input) return null;
+  // If it's already a YYYY-MM-DD:
+  const ymdMatch = input.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (ymdMatch) {
+    const y = parseInt(ymdMatch[1], 10);
+    const m = parseInt(ymdMatch[2], 10) - 1;
+    const d = parseInt(ymdMatch[3], 10);
+    const startLocal = new Date(y, m, d, 0, 0, 0, 0);
+    const endLocal = new Date(y, m, d, 23, 59, 59, 999);
+    return { startISO: startLocal.toISOString(), endISO: endLocal.toISOString() };
+  }
+  // Try parse as ISO-like string
+  const dt = new Date(input);
+  if (!isNaN(dt.getTime())) {
+    // create a local date (calendar date in local timezone)
+    const localDate = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+    const startLocal = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 0, 0, 0, 0);
+    const endLocal = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 23, 59, 59, 999);
+    // Use ISO strings (these are in UTC representation)
+    return { startISO: startLocal.toISOString(), endISO: endLocal.toISOString() };
+  }
+  return null;
+}
+
+exports.handler = async (event) => {
   try {
-    const REQUIRED_KEY = process.env.PROXY_API_KEY || "";
-    if (REQUIRED_KEY) {
-      const incomingKey =
-        getHeaderCaseInsensitive(event.headers, "x-api-key") || "";
-      if (!incomingKey || incomingKey !== REQUIRED_KEY) {
-        return {
-          statusCode: 401,
-          headers: corsHeaders,
-          body: JSON.stringify({ ok: false, error: "invalid_api_key" }),
-        };
-      }
+    // Preflight
+    if (event.httpMethod === "OPTIONS") {
+      return {
+        statusCode: 200,
+        headers: corsHeaders,
+        body: JSON.stringify({ ok: true }),
+      };
     }
 
-    const method = (event.httpMethod || event.method || "POST").toUpperCase();
+    const method = event.httpMethod || "GET";
+    const rawQuery = event.rawQuery || "";
+    const qparams = event.queryStringParameters || {};
+    const forwardPath = qparams.path || getHeaderCaseInsensitive(event.headers, "x-forward-path") || qparams.forwardPath || "";
 
-    // Build payload:
-    let payload = null;
-    if (method === "GET") {
-      // For GET, use parsed queryStringParameters (preferred)
-      payload = event.queryStringParameters || {};
-    } else {
-      if (!event.body) {
-        return {
-          statusCode: 400,
-          headers: corsHeaders,
-          body: JSON.stringify({ ok: false, error: "empty_body" }),
-        };
-      }
-      try {
-        payload = JSON.parse(event.body);
-      } catch (err) {
+    if (DEV_MODE) {
+      console.log("=== proxy incoming ===");
+      console.log("method:", method);
+      console.log("rawQuery:", rawQuery);
+      console.log("queryStringParameters:", JSON.stringify(qparams || {}));
+      console.log("headers:", JSON.stringify(event.headers || {}));
+      console.log("forwardPath:", forwardPath);
+    }
+
+    // Parse payload for non-GET
+    let payload = {};
+    if (method !== "GET") {
+      const rawBody = event.body || "";
+      const parsed = parseJSONSafe(rawBody);
+      if (parsed === null) {
         return {
           statusCode: 400,
           headers: corsHeaders,
           body: JSON.stringify({ ok: false, error: "invalid_json" }),
         };
       }
+      payload = parsed;
+    } else {
+      // For GET, merge query params into payload to make testing easier
+      payload = Object.assign({}, qparams);
     }
 
-    // Basic type validation (if present)
-    const typeLower = ((payload && payload.type) || "")
-      .toString()
-      .toLowerCase();
-    if (typeLower) {
-      if (typeLower === "deal") {
-        const { dealer, customer, amount, dealDate, status } = payload;
-        if (!dealer || !customer || !amount || !dealDate || !status) {
-          return {
-            statusCode: 400,
-            headers: corsHeaders,
-            body: JSON.stringify({ ok: false, error: "missing_fields" }),
-          };
-        }
-      } else if (typeLower === "regular") {
-        const {
-          senderName,
-          receiverName,
-          amountTransferred,
-          dealDate,
-          status,
-        } = payload;
-        if (
-          !senderName ||
-          !receiverName ||
-          !amountTransferred ||
-          !dealDate ||
-          !status
-        ) {
-          return {
-            statusCode: 400,
-            headers: corsHeaders,
-            body: JSON.stringify({ ok: false, error: "missing_fields" }),
-          };
-        }
-      } else {
-        return {
-          statusCode: 400,
-          headers: corsHeaders,
-          body: JSON.stringify({ ok: false, error: "unknown_type" }),
-        };
-      }
+    if (DEV_MODE) {
+      console.log("proxy parsed payload:", JSON.stringify(payload));
     }
 
-    // Compose upstream URL:
+    // Compose upstream URL
+    // If you use per-path env vars like N8N_TRACKER_URL or a single N8N_WEBHOOK_URL,
+    // this logic will pick tracker-specific URL when path === "tracker".
     const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || "";
-    if (!N8N_WEBHOOK_URL) {
+    const N8N_TRACKER_URL = process.env.N8N_TRACKER_URL || "";
+    let upstreamFetchUrl = N8N_WEBHOOK_URL;
+    if (forwardPath && forwardPath.toLowerCase() === "tracker" && N8N_TRACKER_URL) {
+      upstreamFetchUrl = N8N_TRACKER_URL;
+    }
+
+    if (!upstreamFetchUrl) {
       return {
         statusCode: 500,
         headers: corsHeaders,
-        body: JSON.stringify({ ok: false, error: "missing_n8n_webhook_env" }),
+        body: JSON.stringify({ ok: false, error: "missing_upstream" }),
       };
     }
 
-    const N8N_TRACKER_URL = process.env.N8N_TRACKER_URL || "";
-    const N8N_TRACKER_SUGGESTIONS_URL =
-      process.env.N8N_TRACKER_SUGGESTIONS_URL || "";
-
-    const queryPath =
-      (event.queryStringParameters && event.queryStringParameters.path) || "";
-    const headerPath =
-      getHeaderCaseInsensitive(event.headers, "x-forward-path") || "";
-    const extraPath = (queryPath || headerPath || "").toString();
-
-    const base = N8N_WEBHOOK_URL.replace(/\/+$/, "");
-    let upstreamUrl = extraPath
-      ? `${base}/${extraPath.replace(/^\/+/, "")}`
-      : base;
-
-    if (/^https?:\/\//i.test(extraPath)) {
-      upstreamUrl = extraPath;
+    // If this is the tracker endpoint and the client sent `date` (but not startDate/endDate),
+    // compute startDate & endDate and attach them. This avoids timezone matching problems.
+    try {
+      const shouldNormalize = Boolean(getHeaderCaseInsensitive(event.headers, "x-normalize-date") || getHeaderCaseInsensitive(event.headers, "X-Normalize-Date") || qparams.normalizeDate === "1" || qparams.normalizeDate === "true");
+      if (forwardPath && forwardPath.toLowerCase() === "tracker") {
+        // If user sent date and not startDate/endDate, compute them.
+        if ((payload.date || payload.dealDate) && !payload.startDate && !payload.endDate) {
+          const dateInput = payload.date || payload.dealDate;
+          const computed = computeStartEndFromDateString(dateInput);
+          if (computed) {
+            // Attach startDate/endDate as ISO strings.
+            payload.startDate = computed.startISO;
+            payload.endDate = computed.endISO;
+            if (DEV_MODE) {
+              console.log("Normalized date -> startDate/endDate:", payload.startDate, payload.endDate);
+            }
+          } else if (shouldNormalize) {
+            // If requested to normalize but parse failed, still return helpful error in dev
+            if (DEV_MODE) console.warn("Could not parse provided date for normalization:", dateInput);
+          }
+        }
+      }
+    } catch (err) {
+      if (DEV_MODE) console.warn("Date normalization failed:", err && err.message ? err.message : String(err));
     }
 
-    if (
-      (extraPath === "tracker" || extraPath === "/tracker") &&
-      N8N_TRACKER_URL
-    ) {
-      upstreamUrl = N8N_TRACKER_URL;
-    } else if (
-      (extraPath === "tracker/suggestions" ||
-        extraPath === "/tracker/suggestions") &&
-      N8N_TRACKER_SUGGESTIONS_URL
-    ) {
-      upstreamUrl = N8N_TRACKER_SUGGESTIONS_URL;
-    }
-
-    // Prepare headers to forward upstream
+    // Prepare headers to forward
     const upstreamHeaders = {};
-    if (method !== "GET") {
-      upstreamHeaders["Content-Type"] = "application/json";
-    }
+    const forwardHeaderNames = [
+      "x-api-key",
+      "x-forward-path",
+      "x-request-id",
+      "user-agent",
+      "accept",
+      "content-type",
+      "authorization",
+    ];
+    // Add any custom headers you want forwarded by default:
+    const customForward = ["x-custom", "x-normalize-date"];
+    forwardHeaderNames.push(...customForward);
 
+    (forwardHeaderNames || []).forEach((hn) => {
+      const val = getHeaderCaseInsensitive(event.headers, hn);
+      if (val) upstreamHeaders[hn] = val;
+    });
+
+    // If environment has n8n basic auth, attach it
     const N8N_USER = process.env.N8N_USER || "";
     const N8N_PASS = process.env.N8N_PASS || "";
     if (N8N_USER && N8N_PASS) {
       const creds = Buffer.from(`${N8N_USER}:${N8N_PASS}`).toString("base64");
       upstreamHeaders["Authorization"] = `Basic ${creds}`;
     } else {
-      const incomingAuth =
-        getHeaderCaseInsensitive(event.headers, "authorization") || "";
+      // if incoming Authorization exists, forward it
+      const incomingAuth = getHeaderCaseInsensitive(event.headers, "authorization") || "";
       if (incomingAuth) upstreamHeaders["Authorization"] = incomingAuth;
     }
 
-    const forwardHeaderNames = [
-      "x-api-key",
-      "x-custom",
-      "x-request-id",
-      "user-agent",
-      "accept",
-    ];
-    for (const hn of forwardHeaderNames) {
-      const val =
-        getHeaderCaseInsensitive(event.headers, hn) ||
-        getHeaderCaseInsensitive(event.headers, hn.toUpperCase());
-      if (val) upstreamHeaders[hn] = val;
+    if (method !== "GET") upstreamHeaders["Content-Type"] = "application/json";
+
+    if (DEV_MODE) {
+      console.log("Will forward to:", upstreamFetchUrl);
+      console.log("Forward headers:", JSON.stringify(upstreamHeaders));
+      console.log("Forward payload:", JSON.stringify(payload));
     }
 
-    // Build upstream fetch URL (robust handling of rawQuery vs parsed params)
-    let upstreamFetchUrl = upstreamUrl;
-    if (method === "GET") {
-      // Prefer parsed object from queryStringParameters (Netlify provides it)
-      let incomingQs = {};
-      if (
-        event.queryStringParameters &&
-        typeof event.queryStringParameters === "object" &&
-        Object.keys(event.queryStringParameters).length > 0
-      ) {
-        incomingQs = event.queryStringParameters;
-      } else if (event.rawQuery && typeof event.rawQuery === "string") {
-        // rawQuery is a string, parse it into an object
-        incomingQs = parseRawQueryToObj(event.rawQuery);
-      }
-
-      const qsEntries = Object.entries(incomingQs).filter(([k]) => k !== "path");
-      if (qsEntries.length) {
-        // build querystring and support array values
-        const qsParts = [];
-        for (const [k, v] of qsEntries) {
-          if (Array.isArray(v)) {
-            for (const vv of v) {
-              qsParts.push(`${encodeURIComponent(k)}=${encodeURIComponent(vv)}`);
-            }
-          } else {
-            qsParts.push(`${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
-          }
-        }
-        const qs = qsParts.join("&");
-        upstreamFetchUrl =
-          upstreamUrl + (upstreamUrl.includes("?") ? "&" : "?") + qs;
-      }
-    }
-
-    const fetchOptions = {
+    // Perform fetch
+    const resp = await fetch(upstreamFetchUrl, {
       method,
       headers: upstreamHeaders,
+      body: method === "GET" ? undefined : JSON.stringify(payload),
+    });
+
+    const text = await resp.text();
+
+    // Return upstream response (in DEV_MODE we include full upstream body + forwarded payload)
+    const responseBody = {
+      ok: resp.ok,
+      status: resp.status,
     };
 
-    if (method !== "GET" && payload !== null) {
-      fetchOptions.body = JSON.stringify(payload);
+    if (DEV_MODE) {
+      // rich debug info
+      responseBody.upstreamBody = text;
+      responseBody.forwardedPayload = payload;
+      responseBody.upstreamUrl = upstreamFetchUrl;
+    } else {
+      // production: keep minimal
+      responseBody.upstreamBody = text && text.length > 2000 ? text.slice(0, 2000) : text;
     }
 
-    const resp = await fetch(upstreamFetchUrl, fetchOptions);
-
-    const text = await resp.text().catch(() => "");
-
     return {
-      statusCode: resp.ok ? 200 : resp.status || 502,
+      statusCode: resp.status || 200,
       headers: corsHeaders,
-      body: JSON.stringify({
-        ok: resp.ok,
-        status: resp.status,
-        upstreamBody: text.slice(0, 2000),
-      }),
+      body: JSON.stringify(responseBody),
     };
   } catch (err) {
     console.error("proxy error", err);
