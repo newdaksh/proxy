@@ -99,7 +99,11 @@ exports.handler = async function (event, context) {
     const typeLower = ((payload && payload.type) || "")
       .toString()
       .toLowerCase();
-    if (typeLower) {
+
+    // Check if this is a chatbot request (has message field but no type)
+    const isChatbotRequest = payload && payload.message && !payload.type;
+
+    if (typeLower && !isChatbotRequest) {
       if (typeLower === "deal") {
         const { dealer, customer, amount, dealDate, status } = payload;
         if (!dealer || !customer || !amount || !dealDate || !status) {
@@ -137,6 +141,22 @@ exports.handler = async function (event, context) {
           body: JSON.stringify({ ok: false, error: "unknown_type" }),
         };
       }
+    } else if (isChatbotRequest) {
+      // Validate chatbot message format
+      if (
+        !payload.message ||
+        typeof payload.message !== "string" ||
+        !payload.message.trim()
+      ) {
+        return {
+          statusCode: 400,
+          headers: corsHeaders,
+          body: JSON.stringify({
+            ok: false,
+            error: "missing_or_empty_message",
+          }),
+        };
+      }
     }
 
     // Compose upstream URL:
@@ -152,6 +172,7 @@ exports.handler = async function (event, context) {
     const N8N_TRACKER_URL = process.env.N8N_TRACKER_URL || "";
     const N8N_TRACKER_SUGGESTIONS_URL =
       process.env.N8N_TRACKER_SUGGESTIONS_URL || "";
+    const N8N_CHATBOT_WEBHOOK_URL = process.env.N8N_CHATBOT_WEBHOOK_URL || "";
 
     const queryPath =
       (event.queryStringParameters && event.queryStringParameters.path) || "";
@@ -179,6 +200,11 @@ exports.handler = async function (event, context) {
       N8N_TRACKER_SUGGESTIONS_URL
     ) {
       upstreamUrl = N8N_TRACKER_SUGGESTIONS_URL;
+    } else if (
+      (extraPath === "webhook-chatbot" || extraPath === "/webhook-chatbot") &&
+      N8N_CHATBOT_WEBHOOK_URL
+    ) {
+      upstreamUrl = N8N_CHATBOT_WEBHOOK_URL;
     }
 
     // Prepare headers to forward upstream
@@ -228,14 +254,18 @@ exports.handler = async function (event, context) {
         incomingQs = parseRawQueryToObj(event.rawQuery);
       }
 
-      const qsEntries = Object.entries(incomingQs).filter(([k]) => k !== "path");
+      const qsEntries = Object.entries(incomingQs).filter(
+        ([k]) => k !== "path"
+      );
       if (qsEntries.length) {
         // build querystring and support array values
         const qsParts = [];
         for (const [k, v] of qsEntries) {
           if (Array.isArray(v)) {
             for (const vv of v) {
-              qsParts.push(`${encodeURIComponent(k)}=${encodeURIComponent(vv)}`);
+              qsParts.push(
+                `${encodeURIComponent(k)}=${encodeURIComponent(vv)}`
+              );
             }
           } else {
             qsParts.push(`${encodeURIComponent(k)}=${encodeURIComponent(v)}`);
@@ -266,7 +296,7 @@ exports.handler = async function (event, context) {
       body: JSON.stringify({
         ok: resp.ok,
         status: resp.status,
-        upstreamBody: text
+        upstreamBody: text,
       }),
     };
   } catch (err) {
