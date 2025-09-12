@@ -266,7 +266,7 @@ exports.handler = async function (event, context) {
       body: JSON.stringify({
         ok: resp.ok,
         status: resp.status,
-        upstreamBody: text.slice(0, 2000),
+        upstreamBody: text
       }),
     };
   } catch (err) {
