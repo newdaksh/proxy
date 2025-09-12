@@ -290,13 +290,66 @@ exports.handler = async function (event, context) {
 
     const text = await resp.text().catch(() => "");
 
+    // --- NEW: try to parse upstream response as JSON and pick a usable message field
+    let message = "";
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object") {
+        // common fields to look for
+        const candidateFields = [
+          "message",
+          "text",
+          "response",
+          "upstreamBody",
+          "body",
+          "result",
+        ];
+        for (const f of candidateFields) {
+          if (Object.prototype.hasOwnProperty.call(parsed, f)) {
+            const val = parsed[f];
+            if (typeof val === "string") {
+              message = val;
+              break;
+            } else if (typeof val === "object") {
+              // try to stringify small objects
+              try {
+                message = JSON.stringify(val);
+                break;
+              } catch (e) {}
+            }
+          }
+        }
+        // fallback: if parsed has 'ok' and 'upstreamBody' (common with nested proxies)
+        if (!message && parsed.upstreamBody && typeof parsed.upstreamBody === "string") {
+          message = parsed.upstreamBody;
+        }
+        // final fallback: stringify the parsed object
+        if (!message) {
+          try {
+            message = JSON.stringify(parsed);
+          } catch (e) {
+            message = String(parsed);
+          }
+        }
+      } else {
+        message = String(parsed);
+      }
+    } catch (e) {
+      // not JSON, use raw text
+      message = text;
+    }
+
+    // Return both upstreamBody (raw) and message (friendly) for frontend compatibility
     return {
-      statusCode: resp.ok ? 200 : resp.status || 502,
+      // map status code reasonably: use upstream status if available, else 200/502 fallback
+      statusCode: typeof resp.status === "number" ? resp.status : (resp.ok ? 200 : 502),
       headers: corsHeaders,
       body: JSON.stringify({
-        ok: resp.ok,
+        ok: !!resp.ok,
         status: resp.status,
         upstreamBody: text,
+        // new friendly field for UI to consume:
+        message,
       }),
     };
   } catch (err) {
