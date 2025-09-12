@@ -172,7 +172,7 @@ exports.handler = async function (event, context) {
     const N8N_TRACKER_URL = process.env.N8N_TRACKER_URL || "";
     const N8N_TRACKER_SUGGESTIONS_URL =
       process.env.N8N_TRACKER_SUGGESTIONS_URL || "";
-    const N8N_CHATBOT_WEBHOOK_URL = process.env.N8N_CHATBOT_WEBHOOK_URL || "";
+    const N8N_CHATBOT_WEBHOOK_URL = "https://netlify-proxy-daksh.netlify.app/.netlify/functions/proxy?path=https://n8n.dakshjain.me/webhook/webhook-chatbot" || "";
 
     const queryPath =
       (event.queryStringParameters && event.queryStringParameters.path) || "";
